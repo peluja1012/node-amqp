@@ -1,6 +1,7 @@
 var events = require('events'),
     util = require('util'),
     net = require('net'),
+    tls = require('tls'),
     protocol,
     jspack = require('./jspack').jspack,
     Buffer = require('buffer').Buffer,
@@ -67,6 +68,62 @@ function mixin () {
   return target;
 }
 
+// Helper method to proxy getter's, setters, and functions from one object to another
+function proxyMethod(obj,method){
+	var arguments = Array.prototype.slice.call(arguments,2);
+	return obj[method].apply(obj,arguments);
+}
+function proxyGetter(obj,property){
+	return obj[property];
+}
+function proxySetter(obj,property,value){
+	obj[property] = value;
+}
+function objectProxy(a,b) {
+		//if ('object' !== typeof b) { return;}
+		var bproto = Object.getPrototypeOf(b);
+		for (var i in bproto){
+
+			if ('undefined' !== typeof a[i]){
+				continue;
+			}
+			var btype = typeof b[i];
+			var g = bproto.__lookupGetter__(i), s = bproto.__lookupSetter__(i);
+      
+			if ( g || s ) {							
+				if ( g ){												
+						a.__defineGetter__(i, proxyGetter.bind(b,b,i));
+				}
+				if ( s ) {							
+						a.__defineSetter__(i, proxySetter.bind(b,b,i));
+				}
+			}	else if ('function' === btype){
+				a[i] = proxyMethod.bind(b,b,i);										
+			}
+		}
+
+    for ( var i in b ) {
+			var btype = typeof b[i];
+
+			if ('undefined' !== typeof a[i]){
+				continue;
+			}
+
+			var g = b.__lookupGetter__(i), s = b.__lookupSetter__(i);
+
+			if ( g || s ) {							
+				if ( g ){						
+						a.__defineGetter__(i, proxyGetter.bind(b,b,i));
+				}
+				if ( s ) {			
+						a.__defineSetter__(i, proxySetter.bind(b,b,i));
+				}
+			}	else if ('function' === btype){
+				a[i] = proxyMethod.bind(b,b,i);										
+			}
+    }
+    return a;
+}
 
 var debugLevel = process.env['NODE_DEBUG_AMQP'] ? 1 : 0;
 function debug (x) {
@@ -789,22 +846,88 @@ function serializeFields (buffer, fields, args, strict) {
 }
 
 
-function Connection (connectionArgs, options, readyCallback) {
-  net.Stream.call(this);
-
+function Connection (connectionArgs, options, sslOptions, readyCallback) {
   var self = this;
 
   this.setOptions(connectionArgs);
   this.setImplOptions(options);
+  this.setSslOptions(sslOptions);
 
   if (typeof readyCallback === 'function') {
     this._readyCallback = readyCallback;
   }
 
-  var parser;
-  var backoffTime = null;
   this.connectionAttemptScheduled = false;
 
+  this._defaultExchange = null;
+  this.channelCounter = 0;
+  this._sendBuffer = new Buffer(maxFrameBuffer);
+
+
+}
+exports.Connection = Connection;
+
+
+var defaultPorts = { 'amqp': 5672, 'amqps': 5671 };
+
+var defaultOptions = { host: 'localhost'
+                     , port: defaultPorts['amqp']
+                     , login: 'guest'
+                     , password: 'guest'
+                     , vhost: '/'
+                     };
+// If the "reconnect" option is true, then the driver will attempt to
+// reconnect using the configured strategy *any time* the connection
+// becomes unavailable.
+// If this is not appropriate for your application, do not set this option.
+// If you would like this option, you can set parameters controlling how
+// aggressively the reconnections will be attempted.
+// Valid strategies are "linear" and "exponential".
+// Backoff times are in milliseconds.  Under the "linear" strategy, the driver
+// will pause <reconnectBackoffTime> ms before the first attempt, and between
+// each subsequent attempt.  Under the "exponential" strategy, the driver will
+// pause <reconnectBackoffTime> ms before the first attempt, and will double
+// the previous pause between each subsequent attempt until a connection is
+// reestablished.
+var defaultImplOptions = { defaultExchangeName: '', reconnect: true , reconnectBackoffStrategy: 'linear' , reconnectExponentialLimit: 120000, reconnectBackoffTime: 1000 };
+
+var defaultSslOptions = {};
+                        
+function urlOptions(connectionString) {
+  var opts = {};
+  var url = URL.parse(connectionString);
+  var scheme = url.protocol.substring(0, url.protocol.lastIndexOf(':'));
+  if (scheme != 'amqp' && scheme != 'amqps') {
+    throw new Error('Connection URI must use amqp or amqps scheme. ' +
+                    'For example, "amqp://bus.megacorp.internal:5766".');
+  }
+  opts.ssl = ('amqps' === scheme);
+  opts.host = url.hostname;
+  opts.port = url.port || defaultPorts[scheme]
+  if (url.auth) {
+    var auth = url.auth.split(':');
+    auth[0] && (opts.login = auth[0]);
+    auth[1] && (opts.password = auth[1]);
+  }
+  if (url.pathname) {
+    opts.vhost = unescape(url.pathname.substr(1));
+  }
+  return opts;
+}
+
+exports.createConnection = function (connectionArgs, options, sslOptions, readyCallback) {
+  var c = new Connection(connectionArgs, options, sslOptions, readyCallback);
+  // c.setOptions(connectionArgs);
+  // c.setImplOptions(options);
+  c.connect();
+  return c;
+};
+
+Connection.prototype.initConnection = function(conn){
+  var self = this;
+  var parser;
+  var backoffTime = null;
+  
   var backoff = function () {
     if (self._inboundHeartbeatTimer !== null) {
       clearTimeout(self._inboundHeartbeatTimer);
@@ -876,12 +999,8 @@ function Connection (connectionArgs, options, readyCallback) {
       }
     }
   };
-
-  this._defaultExchange = null;
-  this.channelCounter = 0;
-  this._sendBuffer = new Buffer(maxFrameBuffer);
-
-  self.addListener('connect', function () {
+  
+  var onConnect = function () {
     // In the case where this is a reconnection, do not trample on the existing
     // channels.
     // For your reference, channel 0 is the control channel.
@@ -926,14 +1045,31 @@ function Connection (connectionArgs, options, readyCallback) {
     // Time to start the AMQP 7-way connection initialization handshake!
     // 1. The client sends the server a version string
     self.write("AMQP" + String.fromCharCode(0,0,9,1));
-  });
+  };
+  
+  if (this.options.ssl) {
+    console.log('Init SSL Connection');
+    self.addListener('secureConnect', function () {
+      if (conn.authorized) {
+        console.log('client connected authorized');
+      } else {
+        console.log('client connected not authorized due to error:', conn.authorizationError);
+      }
+      onConnect();
+    });  
+  } else {
+    console.log('Init regular connection');
+    self.addListener('connect', function () {
+      onConnect();
+    });
+  }
 
   self.addListener('data', function (data) {
     parser.execute(data);
     self._inboundHeartbeatTimerReset();
   });
 
-  self.addListener('error', function () {
+  self.addListener('error', function (e) {
     backoff();
   });
 
@@ -953,62 +1089,7 @@ function Connection (connectionArgs, options, readyCallback) {
     // Restart the heartbeat to the server
     self._outboundHeartbeatTimerReset();
   })
-}
-util.inherits(Connection, net.Stream);
-exports.Connection = Connection;
-
-
-var defaultPorts = { 'amqp': 5672, 'amqps': 5671 };
-
-var defaultOptions = { host: 'localhost'
-                     , port: defaultPorts['amqp']
-                     , login: 'guest'
-                     , password: 'guest'
-                     , vhost: '/'
-                     };
-// If the "reconnect" option is true, then the driver will attempt to
-// reconnect using the configured strategy *any time* the connection
-// becomes unavailable.
-// If this is not appropriate for your application, do not set this option.
-// If you would like this option, you can set parameters controlling how
-// aggressively the reconnections will be attempted.
-// Valid strategies are "linear" and "exponential".
-// Backoff times are in milliseconds.  Under the "linear" strategy, the driver
-// will pause <reconnectBackoffTime> ms before the first attempt, and between
-// each subsequent attempt.  Under the "exponential" strategy, the driver will
-// pause <reconnectBackoffTime> ms before the first attempt, and will double
-// the previous pause between each subsequent attempt until a connection is
-// reestablished.
-var defaultImplOptions = { defaultExchangeName: '', reconnect: true , reconnectBackoffStrategy: 'linear' , reconnectExponentialLimit: 120000, reconnectBackoffTime: 1000 };
-
-function urlOptions(connectionString) {
-  var opts = {};
-  var url = URL.parse(connectionString);
-  var scheme = url.protocol.substring(0, url.protocol.lastIndexOf(':'));
-  if (scheme != 'amqp' && scheme != 'amqps') {
-    throw new Error('Connection URI must use amqp or amqps scheme. ' +
-                    'For example, "amqp://bus.megacorp.internal:5766".');
-  }
-  opts.ssl = ('amqps' === scheme);
-  opts.host = url.hostname;
-  opts.port = url.port || defaultPorts[scheme]
-  if (url.auth) {
-    var auth = url.auth.split(':');
-    auth[0] && (opts.login = auth[0]);
-    auth[1] && (opts.password = auth[1]);
-  }
-  if (url.pathname) {
-    opts.vhost = unescape(url.pathname.substr(1));
-  }
-  return opts;
-}
-
-exports.createConnection = function (connectionArgs, options, readyCallback) {
-  var c = new Connection(connectionArgs, options, readyCallback);
-  // c.setOptions(connectionArgs);
-  // c.setImplOptions(options);
-  c.connect();
-  return c;
+  
 };
 
 Connection.prototype.setOptions = function (options) {
@@ -1024,6 +1105,12 @@ Connection.prototype.setImplOptions = function (options) {
   this.implOptions = o;
 };
 
+Connection.prototype.setSslOptions = function (options) {
+  var o = {}
+  mixin(o, defaultSslOptions, options || {});
+  this.sslOptions = o;
+};
+
 Connection.prototype.reconnect = function () {
   // Suspend activity on channels
   for (var channel in this.channels) {
@@ -1035,8 +1122,18 @@ Connection.prototype.reconnect = function () {
 };
 
 Connection.prototype.connect = function () {
-  // Connect socket
-  net.Socket.prototype.connect.call(this, this.options.port, this.options.host);
+  var conn;
+  if (this.options.ssl) {
+  	console.log('making ssl connection');
+  	conn = tls.connect(this.options.port, this.options.host, this.sslOptions);
+	} else {
+	  console.log('making non-ssl connection');
+	  // Connect socket
+    conn = net.connect(this.options.port, this.options.host);
+	}
+	//copy connection methods and properties to "this" to keep backwards compatibility
+	objectProxy(this, conn);
+	this.initConnection(conn);
 };
 
 Connection.prototype._onMethod = function (channel, method, args) {
